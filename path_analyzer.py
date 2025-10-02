@@ -555,7 +555,6 @@ class PathAnalyzerApp:
                 # ### CHANGE HERE: Added 'turn_direction' to the header ###
                 writer.writerow(['x_m', 'y_m', 'speed_mps', 'curvature', 'turn_direction'])
                 
-                
                 for i in range(len(points_meters)):
                     x_m, y_m = points_meters[i]
                     speed_mps = v_profile[i]
