@@ -35,8 +35,8 @@ Getting started is easy. You'll need Python 3 installed.
 
 1.  **Clone the repository:**
     ```bash
-    git clone https://github.com/hrishiwastaken/path-analyzer-backend.git
-    cd path-analyzer-backend
+    git clone https://github.com/hrishiwastaken/tarzan-backendgit
+    cd tarzan-backend
     ```
 
 2.  **Create a virtual environment (recommended):**
