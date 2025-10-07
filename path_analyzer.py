@@ -21,27 +21,39 @@ import os
 class PathPropertiesGenerator:
     """Calculates the ideal state (speed, curvature) for a given geometric path."""
     def __init__(self, planning_params):
+        # Store the physics and tuning parameters
         self.p = planning_params
 
     def _calculate_derivatives(self, x, y):
+        # Calculate the first and second derivatives of the path with respect to arc length 's'.
+        # This tells us the path's direction (tangent) and how that direction is changing.
         dx, dy = np.gradient(x), np.gradient(y)
         self.ds = np.sqrt(dx**2 + dy**2)
-        self.ds[self.ds < 1e-6] = 1e-6
+        self.ds[self.ds < 1e-6] = 1e-6 # Avoid division by zero
         self.x_prime = np.gradient(x) / self.ds
         self.y_prime = np.gradient(y) / self.ds
         self.x_double_prime = np.gradient(self.x_prime) / self.ds
         self.y_double_prime = np.gradient(self.y_prime) / self.ds
         
     def _calculate_curvature_and_radius(self):
+        # Use the standard formula for curvature (kappa) from the derivatives.
+        # Curvature is how "bendy" the path is at a certain point. The sign of kappa
+        # tells us the direction of the turn (left/right).
         numerator = self.x_prime * self.y_double_prime - self.y_prime * self.x_double_prime
         denominator = (self.x_prime**2 + self.y_prime**2)**1.5
-        denominator[denominator < 1e-6] = 1e-6
+        denominator[denominator < 1e-6] = 1e-6 # Avoid division by zero
         self.kappa = numerator / denominator
+        
+        # The radius of the turn is just the inverse of the absolute curvature.
+        # A very straight line has a huge radius.
         self.radius = np.full_like(self.kappa, self.p['R_max'])
         mask = np.abs(self.kappa) > self.p['kappa_min']
         self.radius[mask] = 1.0 / np.abs(self.kappa[mask])
 
     def _calculate_effective_radius(self):
+        # We smooth the radius profile using a moving average (convolution).
+        # This lets the planner "look ahead" to anticipate turns, so the vehicle
+        # can slow down *before* entering a sharp corner, not right at it.
         weights_speed = np.ones(self.p['n_speed']) / self.p['n_speed']
         self.R_eff_speed = np.convolve(self.radius, weights_speed, mode='same')
         pad_speed = self.p['n_speed'] // 2
@@ -49,18 +61,29 @@ class PathPropertiesGenerator:
         self.R_eff_speed[-pad_speed:] = self.radius[-1]
         
     def _calculate_curvature_speed_limit(self):
+        # Here's the core physics: v = sqrt(mu * g * R).
+        # This is the maximum speed a vehicle can take a corner of radius R without skidding.
         a_max = self.p['safety_factor'] * self.p['mu'] * self.p['g']
         self.v_profile = np.sqrt(a_max * self.R_eff_speed)
+        # Cap the speed at the vehicle's absolute maximum.
         self.v_profile = np.minimum(self.v_profile, self.p['v_max'])
+        # Make sure we come to a complete stop at the very end of the path.
         self.v_profile[-1] = 0
 
     def generate_properties(self, path_points):
+        """
+        Runs the full pipeline to generate path properties.
+        This is the main public method for this class.
+        """
         if len(path_points) < 5: return None
         x, y = path_points[:, 0], path_points[:, 1]
+        
+        # Run all the calculation steps in order.
         self._calculate_derivatives(x, y)
         self._calculate_curvature_and_radius()
         self._calculate_effective_radius()
         self._calculate_curvature_speed_limit()
+        
         return (path_points, self.v_profile, self.kappa)
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -229,6 +252,7 @@ class InteractiveSlopeWindow(tk.Toplevel):
         self.canvas_img.draw_idle(); self.canvas_math.draw_idle()
 
 class InteractiveSegmentTuner(tk.Toplevel):
+    """A magical pop-up window where you are the master of path segments."""
     def __init__(self, parent, path_data, on_generate_callback):
         super().__init__(parent)
         self.title("Interactive Segment Tuner")
@@ -238,6 +262,7 @@ class InteractiveSegmentTuner(tk.Toplevel):
         self.on_generate_callback = on_generate_callback
         self.segments = []
         
+        # Build the royal court of GUI elements
         main_frame = tk.Frame(self, padx=10, pady=10)
         main_frame.pack(fill=tk.BOTH, expand=True)
         
@@ -247,10 +272,12 @@ class InteractiveSegmentTuner(tk.Toplevel):
         controls_frame = tk.LabelFrame(main_frame, text="Tuning Controls", padx=10, pady=10)
         controls_frame.pack(fill=tk.X, pady=(10, 0))
 
+        # Prepare the canvas for our masterpiece
         self.fig = Figure(); self.ax = self.fig.add_subplot(111)
         self.canvas = FigureCanvasTkAgg(self.fig, master=plot_frame)
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
         
+        # The sacred sliders of segmentation
         self.threshold_var = tk.DoubleVar(value=0.5)
         self.min_len_var = tk.DoubleVar(value=0.05)
         
@@ -268,16 +295,19 @@ class InteractiveSegmentTuner(tk.Toplevel):
         self.min_len_slider.pack(side=tk.LEFT, fill=tk.X, expand=True)
         tk.Label(min_len_frame, textvariable=self.min_len_var, width=5).pack(side=tk.LEFT, padx=(5,0))
 
+        # The big green button to make the magic happen
         tk.Button(controls_frame, text="Generate PATH.TXT", font=("Helvetica", 12, "bold"),
                   bg="#ccffcc", command=self._finalize_and_export).pack(fill=tk.X, ipady=5, pady=(10,0))
         
         self.after(100, self.update_segmentation)
 
     def update_segmentation(self, val=None):
+        """Called every time a slider is moved. It's the circle of life for segments."""
         self.segments = self._run_segmentation(0, len(self.path_data['kappa']))
         self._draw_segments()
 
     def _run_segmentation(self, start_idx, end_idx):
+        """The main segmentation algorithm. Slices and dices the path into straights and turns."""
         if end_idx <= start_idx: return []
         
         straight_threshold = self.threshold_var.get()
@@ -308,6 +338,7 @@ class InteractiveSegmentTuner(tk.Toplevel):
                 current_state = "IN_TURN" if point_is_turn else "IN_STRAIGHT"
                 segment_start_index_rel = i
 
+        # Clean up the last segment after the loop finishes
         abs_start, abs_end = start_idx + segment_start_index_rel, end_idx
         last_seg_dist = np.sum(self.path_data['step_distances'][abs_start:abs_end-1])
         if last_seg_dist >= min_segment_len:
@@ -315,6 +346,7 @@ class InteractiveSegmentTuner(tk.Toplevel):
         return segments
 
     def _create_segment_dict(self, start_idx, end_idx, seg_type):
+        """A little factory for making segment dictionaries."""
         seg_dist = np.sum(self.path_data['step_distances'][start_idx : end_idx-1])
         segment_points_pixels = self.path_data['points_pixels'][start_idx:end_idx]
         
@@ -329,12 +361,14 @@ class InteractiveSegmentTuner(tk.Toplevel):
                 'speed': speed, 'curvature': curvature, 'start_idx': start_idx, 'end_idx': end_idx}
 
     def _draw_segments(self):
+        """The artist's studio. Where segments get their colors and are put on display."""
         self.ax.clear()
         self.ax.set_title(f"Segmentation ({len(self.segments)} segments)")
         self.ax.set_aspect('equal', 'box'); self.ax.invert_yaxis()
         self.ax.grid(True, linestyle='--', alpha=0.6)
 
-        colors = {'STRAIGHT': ['#00FFFF', '#008B8B'], 'ARC': ['#FF00FF', '#8B008B']}
+        # A color palette to distinguish one segment from the next
+        colors = {'STRAIGHT': ['#00FFFF', '#008B8B'], 'ARC': ['#FF00FF', '#8B008B']} # Cyan/DarkCyan, Magenta/DarkMagenta
         color_idx = {'STRAIGHT': 0, 'ARC': 0}
         
         for seg in self.segments:
@@ -343,12 +377,14 @@ class InteractiveSegmentTuner(tk.Toplevel):
             if len(points) > 0:
                 color = colors[seg_type][color_idx[seg_type]]
                 self.ax.plot(points[:, 0], points[:, 1], color=color, linewidth=4)
+                # Flip the color for the next segment of the same type
                 color_idx[seg_type] = 1 - color_idx[seg_type]
         
         self.fig.tight_layout()
         self.canvas.draw()
 
     def _finalize_and_export(self):
+        """Sends the final, user-approved segments off to be written to a file."""
         if not self.segments:
             messagebox.showwarning("Warning", "No segments generated. Try adjusting sliders.", parent=self)
             return
@@ -356,8 +392,9 @@ class InteractiveSegmentTuner(tk.Toplevel):
         self.on_generate_callback(self.segments)
         self.destroy()
 
+
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-# SECTION 3: THE MAIN APPLICATION
+# SECTION 3: THE MAIN ATTRACTION (THE APP ITSELF)
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 class PathAnalyzerApp:
     def __init__(self, root):
@@ -608,6 +645,7 @@ class PathAnalyzerApp:
         else: messagebox.showinfo("Info", "No mask has been generated yet.")
 
     def _on_tuner_generate(self, segments_to_export):
+        """Callback from the tuner to write the final PATH.TXT file."""
         file_path = filedialog.asksaveasfilename(
             defaultextension=".txt", filetypes=[("Text Files", "*.txt"), ("All Files", "*.*")],
             initialfile="PATH.TXT", title="Save Arduino Path Command File"
@@ -628,6 +666,7 @@ class PathAnalyzerApp:
             self.status_label.config(text="An error occurred during file writing.")
 
     def export_path_data(self):
+        """Prepares path data and launches the interactive segment tuner."""
         if self.tck is None or self.u_params is None:
             messagebox.showerror("Error", "No valid smooth path to export.")
             return
@@ -640,7 +679,7 @@ class PathAnalyzerApp:
                 'g': 9.81, 'mu': 0.8, 'safety_factor': 0.7, 'v_max': 2.5,
                 'n_speed': 40, 'kappa_min': 1e-6, 'R_max': 10000.0,
             }
-            num_points = 1000 
+            num_points = 1000 # Use a fixed high resolution for tuning
             u_vals_export = np.linspace(self.u_params.min(), self.u_params.max(), num_points)
             points_pixels = np.column_stack(splev(u_vals_export, self.tck))
             points_meters = points_pixels / self.pixels_per_meter
