@@ -7,8 +7,10 @@ import numpy as np
 from scipy.interpolate import splprep, splev
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import matplotlib.pyplot as plt
 from PIL import Image, ImageTk
 import csv
+import os
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # SECTION 0: PATH PROPERTIES GENERATOR (THE BRAIN)
@@ -17,43 +19,29 @@ import csv
 # perfect line through a track, based only on physics.
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 class PathPropertiesGenerator:
-    """
-    Calculates the ideal state (speed, curvature) for a given geometric path.
-    """
+    """Calculates the ideal state (speed, curvature) for a given geometric path."""
     def __init__(self, planning_params):
-        # Store the physics and tuning parameters
         self.p = planning_params
 
     def _calculate_derivatives(self, x, y):
-        # Calculate the first and second derivatives of the path with respect to arc length 's'.
-        # This tells us the path's direction (tangent) and how that direction is changing.
-        dx = np.gradient(x); dy = np.gradient(y)
+        dx, dy = np.gradient(x), np.gradient(y)
         self.ds = np.sqrt(dx**2 + dy**2)
-        self.ds[self.ds < 1e-6] = 1e-6 # Avoid division by zero
+        self.ds[self.ds < 1e-6] = 1e-6
         self.x_prime = np.gradient(x) / self.ds
         self.y_prime = np.gradient(y) / self.ds
         self.x_double_prime = np.gradient(self.x_prime) / self.ds
         self.y_double_prime = np.gradient(self.y_prime) / self.ds
         
     def _calculate_curvature_and_radius(self):
-        # Use the standard formula for curvature (kappa) from the derivatives.
-        # Curvature is how "bendy" the path is at a certain point. The sign of kappa
-        # tells us the direction of the turn (left/right).
         numerator = self.x_prime * self.y_double_prime - self.y_prime * self.x_double_prime
         denominator = (self.x_prime**2 + self.y_prime**2)**1.5
-        denominator[denominator < 1e-6] = 1e-6 # Avoid division by zero
+        denominator[denominator < 1e-6] = 1e-6
         self.kappa = numerator / denominator
-        
-        # The radius of the turn is just the inverse of the absolute curvature.
-        # A very straight line has a huge radius.
         self.radius = np.full_like(self.kappa, self.p['R_max'])
         mask = np.abs(self.kappa) > self.p['kappa_min']
         self.radius[mask] = 1.0 / np.abs(self.kappa[mask])
 
     def _calculate_effective_radius(self):
-        # We smooth the radius profile using a moving average (convolution).
-        # This lets the planner "look ahead" to anticipate turns, so the vehicle
-        # can slow down *before* entering a sharp corner, not right at it.
         weights_speed = np.ones(self.p['n_speed']) / self.p['n_speed']
         self.R_eff_speed = np.convolve(self.radius, weights_speed, mode='same')
         pad_speed = self.p['n_speed'] // 2
@@ -61,53 +49,40 @@ class PathPropertiesGenerator:
         self.R_eff_speed[-pad_speed:] = self.radius[-1]
         
     def _calculate_curvature_speed_limit(self):
-        # Here's the core physics: v = sqrt(mu * g * R).
-        # This is the maximum speed a vehicle can take a corner of radius R without skidding.
         a_max = self.p['safety_factor'] * self.p['mu'] * self.p['g']
         self.v_profile = np.sqrt(a_max * self.R_eff_speed)
-        # Cap the speed at the vehicle's absolute maximum.
         self.v_profile = np.minimum(self.v_profile, self.p['v_max'])
-        # Make sure we come to a complete stop at the very end of the path.
         self.v_profile[-1] = 0
 
     def generate_properties(self, path_points):
-        """
-        Runs the full pipeline to generate path properties.
-        This is the main public method for this class.
-        """
         if len(path_points) < 5: return None
-        x = path_points[:, 0]; y = path_points[:, 1]
-        
-        # Run all the calculation steps in order.
+        x, y = path_points[:, 0], path_points[:, 1]
         self._calculate_derivatives(x, y)
         self._calculate_curvature_and_radius()
         self._calculate_effective_radius()
         self._calculate_curvature_speed_limit()
-        
         return (path_points, self.v_profile, self.kappa)
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # SECTION 1: THE ALCHEMY LAB (CORE IMAGE PROCESSING)
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
 def skeletonize_image(image):
     """Whittles a shape down to its bare bones (a 1-pixel wide centerline)."""
     skeleton = np.zeros(image.shape, np.uint8)
     element = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
-    while True:
+    while cv2.countNonZero(image) != 0:
         eroded = cv2.erode(image, element)
         temp = cv2.dilate(eroded, element)
         temp = cv2.subtract(image, temp)
         skeleton = cv2.bitwise_or(skeleton, temp)
         image = eroded.copy()
-        if cv2.countNonZero(image) == 0:
-            break
     return skeleton
 
 def preprocess_and_extract_path(image_path, lower_bound, upper_bound):
     """The master plan for path extraction from an image."""
     img = cv2.imread(image_path)
     if img is None: return None, None, None, 1.0
+    original_img = cv2.imread(image_path)
 
     scale_factor = 1.0
     if img.shape[1] > 1000:
@@ -121,11 +96,10 @@ def preprocess_and_extract_path(image_path, lower_bound, upper_bound):
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=3)
 
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours: return cv2.imread(image_path), None, mask, scale_factor
+    if not contours: return original_img, None, mask, scale_factor
 
     largest_contour = max(contours, key=cv2.contourArea)
     clean_mask = np.zeros(mask.shape, np.uint8)
-    
     cv2.drawContours(clean_mask, [largest_contour], -1, 255, thickness=cv2.FILLED)
     
     erosion_kernel = np.ones((3,3), np.uint8)
@@ -134,10 +108,10 @@ def preprocess_and_extract_path(image_path, lower_bound, upper_bound):
     skeleton = skeletonize_image(eroded_mask)
 
     rows, cols = np.where(skeleton > 0)
-    if len(rows) < 2: return cv2.imread(image_path), None, skeleton, scale_factor
+    if len(rows) < 2: return original_img, None, skeleton, scale_factor
 
     all_points_scaled = np.column_stack((cols, rows))
-    return cv2.imread(image_path), all_points_scaled, clean_mask, scale_factor
+    return original_img, all_points_scaled, clean_mask, scale_factor
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # SECTION 2: POP-UP WINDOWS OF WONDER
@@ -254,8 +228,136 @@ class InteractiveSlopeWindow(tk.Toplevel):
         else: self.point_on_math.set_data([cx], [cy]); self.tangent_on_math.set_data(x_coords, y_coords)
         self.canvas_img.draw_idle(); self.canvas_math.draw_idle()
 
+class InteractiveSegmentTuner(tk.Toplevel):
+    def __init__(self, parent, path_data, on_generate_callback):
+        super().__init__(parent)
+        self.title("Interactive Segment Tuner")
+        self.geometry("1000x800")
+
+        self.path_data = path_data
+        self.on_generate_callback = on_generate_callback
+        self.segments = []
+        
+        main_frame = tk.Frame(self, padx=10, pady=10)
+        main_frame.pack(fill=tk.BOTH, expand=True)
+        
+        plot_frame = tk.Frame(main_frame)
+        plot_frame.pack(fill=tk.BOTH, expand=True)
+
+        controls_frame = tk.LabelFrame(main_frame, text="Tuning Controls", padx=10, pady=10)
+        controls_frame.pack(fill=tk.X, pady=(10, 0))
+
+        self.fig = Figure(); self.ax = self.fig.add_subplot(111)
+        self.canvas = FigureCanvasTkAgg(self.fig, master=plot_frame)
+        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        
+        self.threshold_var = tk.DoubleVar(value=0.5)
+        self.min_len_var = tk.DoubleVar(value=0.05)
+        
+        thresh_frame = tk.Frame(controls_frame); thresh_frame.pack(fill=tk.X, expand=True, pady=2)
+        tk.Label(thresh_frame, text="Straightness Threshold (1/radius):", width=25, anchor='w').pack(side=tk.LEFT)
+        self.thresh_slider = tk.Scale(thresh_frame, from_=0.0, to=5.0, resolution=0.05,
+                                      orient=tk.HORIZONTAL, variable=self.threshold_var, command=self.update_segmentation)
+        self.thresh_slider.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        tk.Label(thresh_frame, textvariable=self.threshold_var, width=5).pack(side=tk.LEFT, padx=(5,0))
+
+        min_len_frame = tk.Frame(controls_frame); min_len_frame.pack(fill=tk.X, expand=True, pady=2)
+        tk.Label(min_len_frame, text="Minimum Segment Length (meters):", width=25, anchor='w').pack(side=tk.LEFT)
+        self.min_len_slider = tk.Scale(min_len_frame, from_=0.0, to=0.5, resolution=0.01,
+                                     orient=tk.HORIZONTAL, variable=self.min_len_var, command=self.update_segmentation)
+        self.min_len_slider.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        tk.Label(min_len_frame, textvariable=self.min_len_var, width=5).pack(side=tk.LEFT, padx=(5,0))
+
+        tk.Button(controls_frame, text="Generate PATH.TXT", font=("Helvetica", 12, "bold"),
+                  bg="#ccffcc", command=self._finalize_and_export).pack(fill=tk.X, ipady=5, pady=(10,0))
+        
+        self.after(100, self.update_segmentation)
+
+    def update_segmentation(self, val=None):
+        self.segments = self._run_segmentation(0, len(self.path_data['kappa']))
+        self._draw_segments()
+
+    def _run_segmentation(self, start_idx, end_idx):
+        if end_idx <= start_idx: return []
+        
+        straight_threshold = self.threshold_var.get()
+        min_segment_len = self.min_len_var.get()
+        
+        segments = []
+        current_state = "IDLE"
+        segment_start_index_rel = 0
+
+        for i in range(end_idx - start_idx):
+            current_abs_idx = start_idx + i
+            point_is_turn = abs(self.path_data['kappa'][current_abs_idx]) > straight_threshold
+            
+            transitioned, end_state = False, None
+            if current_state == "IDLE":
+                current_state = "IN_TURN" if point_is_turn else "IN_STRAIGHT"
+                segment_start_index_rel = i
+            elif current_state == "IN_STRAIGHT" and point_is_turn:
+                transitioned, end_state = True, "IN_STRAIGHT"
+            elif current_state == "IN_TURN" and not point_is_turn:
+                transitioned, end_state = True, "IN_TURN"
+
+            if transitioned:
+                abs_start, abs_end = start_idx + segment_start_index_rel, start_idx + i
+                seg_dist = np.sum(self.path_data['step_distances'][abs_start : abs_end-1])
+                if seg_dist >= min_segment_len:
+                    segments.append(self._create_segment_dict(abs_start, abs_end, end_state))
+                current_state = "IN_TURN" if point_is_turn else "IN_STRAIGHT"
+                segment_start_index_rel = i
+
+        abs_start, abs_end = start_idx + segment_start_index_rel, end_idx
+        last_seg_dist = np.sum(self.path_data['step_distances'][abs_start:abs_end-1])
+        if last_seg_dist >= min_segment_len:
+            segments.append(self._create_segment_dict(abs_start, abs_end, current_state))
+        return segments
+
+    def _create_segment_dict(self, start_idx, end_idx, seg_type):
+        seg_dist = np.sum(self.path_data['step_distances'][start_idx : end_idx-1])
+        segment_points_pixels = self.path_data['points_pixels'][start_idx:end_idx]
+        
+        if seg_type == "IN_STRAIGHT":
+            speed, curvature, viz_type = self.path_data['v_max'], 0.0, 'STRAIGHT'
+        else: # IN_TURN
+            speed = np.mean(self.path_data['v_profile'][start_idx:end_idx])
+            curvature = np.mean(self.path_data['kappa'][start_idx:end_idx])
+            viz_type = 'ARC'
+        
+        return {'type': viz_type, 'points': segment_points_pixels, 'dist': seg_dist,
+                'speed': speed, 'curvature': curvature, 'start_idx': start_idx, 'end_idx': end_idx}
+
+    def _draw_segments(self):
+        self.ax.clear()
+        self.ax.set_title(f"Segmentation ({len(self.segments)} segments)")
+        self.ax.set_aspect('equal', 'box'); self.ax.invert_yaxis()
+        self.ax.grid(True, linestyle='--', alpha=0.6)
+
+        colors = {'STRAIGHT': ['#00FFFF', '#008B8B'], 'ARC': ['#FF00FF', '#8B008B']}
+        color_idx = {'STRAIGHT': 0, 'ARC': 0}
+        
+        for seg in self.segments:
+            points = seg['points']
+            seg_type = seg['type']
+            if len(points) > 0:
+                color = colors[seg_type][color_idx[seg_type]]
+                self.ax.plot(points[:, 0], points[:, 1], color=color, linewidth=4)
+                color_idx[seg_type] = 1 - color_idx[seg_type]
+        
+        self.fig.tight_layout()
+        self.canvas.draw()
+
+    def _finalize_and_export(self):
+        if not self.segments:
+            messagebox.showwarning("Warning", "No segments generated. Try adjusting sliders.", parent=self)
+            return
+        
+        self.on_generate_callback(self.segments)
+        self.destroy()
+
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-# SECTION 3: THE MAIN ATTRACTION (THE APP ITSELF)
+# SECTION 3: THE MAIN APPLICATION
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 class PathAnalyzerApp:
     def __init__(self, root):
@@ -293,10 +395,8 @@ class PathAnalyzerApp:
         self.nodes_slider = tk.Scale(tuning_frame, from_=2, to=1000, orient=tk.HORIZONTAL, variable=self.nodes_var, command=self.update_node_display_during_selection, showvalue=0); self.nodes_slider.pack(fill=tk.X)
         
         export_frame = tk.LabelFrame(controls_frame, text="Export for Vehicle Control", padx=10, pady=10); export_frame.pack(fill=tk.X, padx=10, pady=5)
-        tk.Label(export_frame, text="Export Path Resolution (Number of Steps):").pack()
-        self.export_nodes_var = tk.IntVar(value=100)
-        self.export_nodes_slider = tk.Scale(export_frame, from_=10, to=500, orient=tk.HORIZONTAL, variable=self.export_nodes_var, state=tk.DISABLED); self.export_nodes_slider.pack(fill=tk.X, pady=(0, 5))
-        self.btn_export = tk.Button(export_frame, text="4. Export Path to CSV", command=self.export_path_data, state=tk.DISABLED, bg="#ccffcc"); self.btn_export.pack(fill=tk.X)
+        self.btn_export = tk.Button(export_frame, text="4. Tune and Export Path...", command=self.export_path_data, state=tk.DISABLED, bg="#ccffcc")
+        self.btn_export.pack(fill=tk.X, ipady=5)
         
         tools_frame = tk.LabelFrame(controls_frame, text="Diagnostic Tools", padx=10, pady=5); tools_frame.pack(fill=tk.X, padx=10, pady=5)
         self.btn_calibrate = tk.Button(tools_frame, text="Calibrate Pixel/Meter Scale...", command=self.start_scale_calibration, state=tk.DISABLED); self.btn_calibrate.pack(fill=tk.X, pady=2)
@@ -323,7 +423,7 @@ class PathAnalyzerApp:
         self.update_math_plot()
         self.btn_tuner.config(state=tk.NORMAL); self.btn_calibrate.config(state=tk.NORMAL); self.btn_analyze.config(state=tk.DISABLED)
         self.btn_show_mask.config(state=tk.DISABLED); self.btn_slope.config(state=tk.DISABLED); self.path_length_slider.config(state=tk.DISABLED)
-        self.btn_export.config(state=tk.DISABLED); self.export_nodes_slider.config(state=tk.DISABLED)
+        self.btn_export.config(state=tk.DISABLED)
         self._disconnect_event_handlers()
         self.status_label.config(text="Image loaded. Calibrate scale or tune colors.")
 
@@ -407,33 +507,23 @@ class PathAnalyzerApp:
 
     def find_shortest_path(self, points, start_point, end_point):
         if len(points) < 2: return points
-
         start_idx = np.argmin(np.linalg.norm(points - start_point, axis=1))
         end_idx = np.argmin(np.linalg.norm(points - end_point, axis=1))
-
         num_points = len(points)
         dist = np.full(num_points, np.inf)
         prev = np.full(num_points, -1, dtype=int)
         dist[start_idx] = 0
-        
         pq = [(0, start_idx)]
         visited_indices = set()
-
         while pq:
             d, u_idx = heapq.heappop(pq)
-
-            if u_idx in visited_indices:
-                continue
+            if u_idx in visited_indices: continue
             visited_indices.add(u_idx)
-            
-            if u_idx == end_idx:
-                break
-
+            if u_idx == end_idx: break
             u_coords = points[u_idx]
             diffs = points - u_coords
             dists_sq = np.sum(diffs**2, axis=1)
             neighbor_indices = np.where((dists_sq > 0) & (dists_sq < 5**2))[0] 
-
             for v_idx in neighbor_indices:
                 if v_idx not in visited_indices:
                     edge_weight = np.sqrt(dists_sq[v_idx])
@@ -441,7 +531,6 @@ class PathAnalyzerApp:
                         dist[v_idx] = dist[u_idx] + edge_weight
                         prev[v_idx] = u_idx
                         heapq.heappush(pq, (dist[v_idx], v_idx))
-        
         path = []
         curr_idx = end_idx
         if prev[curr_idx] != -1 or curr_idx == start_idx:
@@ -449,15 +538,14 @@ class PathAnalyzerApp:
                 path.append(points[curr_idx])
                 curr_idx = prev[curr_idx]
             return np.array(path[::-1])
-        else:
-            return None
+        return None
         
     def _update_path_length(self, val=None):
         if self.all_ordered_points is None: return
         length = self.path_length_var.get(); self.active_ordered_points = self.all_ordered_points[:length]
         if len(self.active_ordered_points) < 4:
             self.smooth_path_points = None; self.tck = None; self.btn_slope.config(state=tk.DISABLED)
-            self.btn_export.config(state=tk.DISABLED); self.export_nodes_slider.config(state=tk.DISABLED)
+            self.btn_export.config(state=tk.DISABLED)
             self.update_node_display_during_selection(); return
         try:
             x, y = self.active_ordered_points[:, 0], self.active_ordered_points[:, 1]
@@ -466,11 +554,11 @@ class PathAnalyzerApp:
             if self.tck:
                 num_smooth_points = len(self.active_ordered_points) * 2; self.u_params = np.linspace(u.min(), u.max(), num_smooth_points)
                 x_final, y_final = splev(self.u_params, self.tck); self.smooth_path_points = np.column_stack((x_final, y_final))
-                self.btn_slope.config(state=tk.NORMAL); self.btn_export.config(state=tk.NORMAL); self.export_nodes_slider.config(state=tk.NORMAL)
+                self.btn_slope.config(state=tk.NORMAL); self.btn_export.config(state=tk.NORMAL)
             else: raise ValueError("Spline creation failed.")
         except Exception:
             self.smooth_path_points = None; self.tck = None; self.btn_slope.config(state=tk.DISABLED)
-            self.btn_export.config(state=tk.DISABLED); self.export_nodes_slider.config(state=tk.DISABLED)
+            self.btn_export.config(state=tk.DISABLED)
         self.update_node_display_during_selection()
 
     def update_node_display_during_selection(self, val=None):
@@ -489,17 +577,16 @@ class PathAnalyzerApp:
         if self.smooth_path_points is not None: self.ax.plot(self.smooth_path_points[:, 0], self.smooth_path_points[:, 1], color='red', linewidth=2.5, label='Fitted Smooth Path', zorder=4)
         if self.displayed_nodes is not None: self.ax.scatter(self.displayed_nodes[:, 0], self.displayed_nodes[:, 1], c='cyan', s=35, zorder=5, edgecolors='black', label='Nodes')
         if self.start_node is not None: self.ax.scatter(self.start_node[0], self.start_node[1], c='lime', s=150, zorder=6, edgecolors='black', label='Start')
-        if self.smooth_path_points is not None: self.ax.legend()
-        self.ax.set_title("Path Node Overlay"); self.ax.axis('off'); self.canvas.draw()
+        self.ax.legend(); self.ax.set_title("Path Node Overlay"); self.ax.axis('off'); self.canvas.draw()
         
     def update_math_plot(self):
         self.math_ax.clear(); self.math_ax.set_title("Mathematical 2D Plot"); self.math_ax.grid(True, linestyle='--', alpha=0.6)
         if self.smooth_path_points is None: self.math_canvas.draw(); return
         x_range = np.ptp(self.smooth_path_points[:, 0]); y_range = np.ptp(self.smooth_path_points[:, 1]); is_rotated = y_range > x_range
         if is_rotated:
-            self.math_ax.plot(self.smooth_path_points[:, 1], self.smooth_path_points[:, 0], 'r-'); self.math_ax.set_xlabel("Primary Axis (Y pixels)"); self.math_ax.set_ylabel("Secondary Axis (X pixels)")
+            self.math_ax.plot(self.smooth_path_points[:, 1], self.smooth_path_points[:, 0], 'r-'); self.math_ax.set_xlabel("Y pixels"); self.math_ax.set_ylabel("X pixels")
         else:
-            self.math_ax.plot(self.smooth_path_points[:, 0], self.smooth_path_points[:, 1], 'r-'); self.math_ax.set_xlabel("Primary Axis (X pixels)"); self.math_ax.set_ylabel("Secondary Axis (Y pixels)")
+            self.math_ax.plot(self.smooth_path_points[:, 0], self.smooth_path_points[:, 1], 'r-'); self.math_ax.set_xlabel("X pixels"); self.math_ax.set_ylabel("Y pixels")
         self.math_ax.set_aspect('equal', adjustable='box'); self.math_ax.invert_yaxis(); self.math_fig.tight_layout(); self.math_canvas.draw()
     
     def on_tuner_apply(self, new_lower, new_upper):
@@ -510,7 +597,8 @@ class PathAnalyzerApp:
         if self.image_path: ColorTunerWindow(self.root, self.image_path, self.hsv_lower, self.hsv_upper, self.on_tuner_apply)
     
     def open_slope_visualizer(self):
-        if self.smooth_path_points is not None: InteractiveSlopeWindow(self.root, self.original_cv_img, self.smooth_path_points, self.tck, self.u_params)
+        if self.smooth_path_points is not None and self.tck is not None:
+            InteractiveSlopeWindow(self.root, self.original_cv_img, self.smooth_path_points, self.tck, self.u_params)
         
     def display_image(self, cv_img, title=""):
         self.ax.clear(); img_rgb = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB); self.ax.imshow(img_rgb, aspect='equal'); self.ax.set_title(title); self.ax.axis('off'); self.canvas.draw()
@@ -519,63 +607,65 @@ class PathAnalyzerApp:
         if self.final_mask is not None: MaskViewer(self.root, self.final_mask)
         else: messagebox.showinfo("Info", "No mask has been generated yet.")
 
-    def export_path_data(self):
-        """The final step: calculate physics and write the CSV file with turn direction."""
-        if self.tck is None or self.u_params is None: messagebox.showerror("Error", "No valid smooth path to export."); return
-        if self.pixels_per_meter is None: messagebox.showerror("Error", "Scale not calibrated! Use the 'Calibrate Pixel/Meter Scale' tool."); return
-        
-        file_path = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV Files", "*.csv")], title="Save Path State Trajectory")
-        if not file_path: return
-
-        planning_params = {
-            'g': 9.81, 'mu': 0.8, 'safety_factor': 0.7, 'v_max': 2.5,
-            'n_speed': 40, 'kappa_min': 1e-6, 'R_max': 10000.0,
-        }
-        
-        num_points = self.export_nodes_var.get()
-        u_vals_export = np.linspace(self.u_params.min(), self.u_params.max(), num_points)
-        points_pixels = np.column_stack(splev(u_vals_export, self.tck))
-        points_meters = points_pixels / self.pixels_per_meter
-        
+    def _on_tuner_generate(self, segments_to_export):
+        file_path = filedialog.asksaveasfilename(
+            defaultextension=".txt", filetypes=[("Text Files", "*.txt"), ("All Files", "*.*")],
+            initialfile="PATH.TXT", title="Save Arduino Path Command File"
+        )
+        if not file_path:
+            self.status_label.config(text="Export cancelled.")
+            return
         try:
-            self.status_label.config(text="Calculating path properties..."); self.root.update_idletasks()
-            
+            with open(file_path, 'w') as f:
+                f.write("# Arduino Path Commands (Adaptive Segments)\n")
+                f.write("# Format: DISTANCE,SPEED,CURVATURE\n")
+                for seg in segments_to_export:
+                    f.write(f"{seg['dist']:.4f},{seg['speed']:.4f},{seg['curvature']:.4f}\n")
+            messagebox.showinfo("Success", f"Path successfully exported into {len(segments_to_export)} adaptive segments.\n\nFile saved to: {os.path.basename(file_path)}")
+            self.status_label.config(text="Adaptive export complete!")
+        except Exception as e:
+            messagebox.showerror("Export Error", f"Failed to write path file: {e}", parent=self.root)
+            self.status_label.config(text="An error occurred during file writing.")
+
+    def export_path_data(self):
+        if self.tck is None or self.u_params is None:
+            messagebox.showerror("Error", "No valid smooth path to export.")
+            return
+        if self.pixels_per_meter is None:
+            messagebox.showerror("Error", "Scale not calibrated! Use 'Calibrate Pixel/Meter Scale'.")
+            return
+        self.status_label.config(text="Calculating high-resolution path properties..."); self.root.update_idletasks()
+        try:
+            planning_params = {
+                'g': 9.81, 'mu': 0.8, 'safety_factor': 0.7, 'v_max': 2.5,
+                'n_speed': 40, 'kappa_min': 1e-6, 'R_max': 10000.0,
+            }
+            num_points = 1000 
+            u_vals_export = np.linspace(self.u_params.min(), self.u_params.max(), num_points)
+            points_pixels = np.column_stack(splev(u_vals_export, self.tck))
+            points_meters = points_pixels / self.pixels_per_meter
+
             prop_generator = PathPropertiesGenerator(planning_params)
             result = prop_generator.generate_properties(points_meters)
             
-            if result is None:
-                messagebox.showerror("Error", "Path is too short to generate properties.")
-                return
+            if result is None: raise ValueError("Path is too short to generate properties.")
 
             _, v_profile, kappa = result
+            diffs = np.diff(points_meters, axis=0)
+            step_distances = np.sqrt(np.sum(diffs**2, axis=1))
+
+            path_data_for_tuner = {
+                'points_pixels': points_pixels, 'points_meters': points_meters,
+                'v_profile': v_profile, 'kappa': kappa, 'step_distances': step_distances,
+                'v_max': planning_params['v_max']
+            }
             
-            # Write the new, more descriptive format to the CSV file
-            with open(file_path, 'w', newline='') as csvfile:
-                writer = csv.writer(csvfile)
-                # ### CHANGE HERE: Added 'turn_direction' to the header ###
-                writer.writerow(['x_m', 'y_m', 'speed_mps', 'curvature', 'turn_direction'])
-                
-                for i in range(len(points_meters)):
-                    x_m, y_m = points_meters[i]
-                    speed_mps = v_profile[i]
-                    current_kappa = kappa[i]
-                    
-                    # ### CHANGE HERE: Logic to determine turn direction from kappa's sign ###
-                    turn_direction = "Straight"
-                    # We use a small threshold to avoid classifying tiny wiggles as turns
-                    if current_kappa > 0.01: 
-                        turn_direction = "Left"
-                    elif current_kappa < -0.01:
-                        turn_direction = "Right"
-                    
-                    # ### CHANGE HERE: Added the new value to the row ###
-                    writer.writerow([f"{x_m:.4f}", f"{y_m:.4f}", f"{speed_mps:.4f}", f"{current_kappa:.4f}", turn_direction])
-            
-            messagebox.showinfo("Success", f"Path trajectory ({len(points_meters)} points) exported to:\n{file_path}")
-            self.status_label.config(text="Export complete! Ready for next task.")
+            self.status_label.config(text="Ready for tuning. Opening tuner window...")
+            InteractiveSegmentTuner(self.root, path_data_for_tuner, self._on_tuner_generate)
+
         except Exception as e:
-            messagebox.showerror("Error", f"Failed to generate or write path properties: {e}")
-            self.status_label.config(text="An error occurred during export.")
+            messagebox.showerror("Export Error", f"Failed to prepare data for tuner: {e}")
+            self.status_label.config(text="An error occurred during export preparation.")
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # SECTION 4: THE IGNITION SWITCH
