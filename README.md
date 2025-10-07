@@ -2,7 +2,7 @@
 
 Ever wanted to turn a squiggly line in a picture into a real-world, drivable path for your robot? Tired of manually plotting waypoints? Then welcome to the Path Analyzer 9000!
 
-This tool lets you take any image with a line on it, and with a few clicks, it magically extracts that line, smooths it out, and calculates the perfect speed for every twist and turn. It then spits out a simple CSV file that your robot's controller can follow.
+This tool is your one-stop-shop for autonomous path creation. It lets you take any image with a line on it, and with a few clicks, it magically extracts that line, smooths it out, and breaks it down into intelligent segments of straights and turns. It calculates the perfect speed for every twist and curve, then spits out a simple command file that your robot's controller can follow.
 
 ## ✨ Features
 
@@ -12,22 +12,24 @@ This tool lets you take any image with a line on it, and with a few clicks, it m
 *   **Click-to-Select Endpoints:** You're the boss. Just click where the path starts and ends.
 *   **Buttery-Smooth Curves:** Converts jagged pixel lines into a beautiful, mathematically perfect spline curve.
 *   **Physics-Based Speed Profiling:** Calculates the ideal speed and curvature for every point on the path based on real-world physics (like friction and G-forces). This isn't just a path, it's a *race line*!
-*   **Export to CSV:** Generates a ready-to-use `.csv` file with coordinates, speed, and curvature, perfect for feeding into your vehicle's control system.
-*   **Helpful Diagnostic Tools:** Calibrate your image scale (pixels to meters) and interactively inspect the path's slope and angle.
+*   **Interactive Segment Tuner:** A powerful pop-up window where you can visually tune how the path is broken into straights and turns in real-time. What you see is what you get!
+*   **Smart Segment Export:** Generates a ready-to-use `PATH.TXT` file with a list of high-level commands (`DISTANCE,SPEED,CURVATURE`), perfect for a simple robot controller.
 
 ## 🤔 The Secret Sauce: How It Works
 
 The magic happens in a few key steps:
 
-1.  **Color Sorcery (Image Processing):** First, we convert the image to the HSV color space, which is great for isolating colors. Using the `` `Color Tuner` ``, you create a mask that highlights just your path. The app is smart enough to find the biggest colored shape and fill it in, so it doesn't matter if your line is thick or thin.
+1.  **Color Sorcery (Image Processing):** First, we convert the image to the HSV color space, which is great for isolating colors. Using the `Color Tuner`, you create a mask that highlights just your path.
 
-2.  **Finding the Centerline (Skeletonization):** The solid shape of your path is then put on a diet! A skeletonization algorithm whittles it down to its bare bones—a perfect, one-pixel-wide centerline. This ensures you get a single, clean path of nodes.
+2.  **Finding the Centerline (Skeletonization):** The solid shape of your path is then put on a diet! A skeletonization algorithm whittles it down to its bare bones—a perfect, one-pixel-wide centerline.
 
-3.  **Connecting the Dots (Pathfinding):** With a cloud of skeleton points, you click on your desired start and end. The app uses **Dijkstra's algorithm** (like a mini-GPS) to find the absolute shortest path between your two clicks, flawlessly navigating any branches or forks in the skeleton. No more weird glitches!
+3.  **Connecting the Dots (Pathfinding):** With a cloud of skeleton points, you click on your desired start and end. The app uses **Dijkstra's algorithm** (like a mini-GPS) to find the absolute shortest path between your two clicks.
 
 4.  **Making it Smooth (Spline Interpolation):** The jagged list of pixel coordinates is transformed into a smooth, continuous curve using B-splines. This gives us a path that a real vehicle can actually follow without getting jerky.
 
-5.  **Adding the Physics (Path Properties):** This is where the real brains are. The tool analyzes the smoothed path's geometry at every point to calculate its **curvature** (how tight a turn is). Using parameters like the coefficient of friction (`` `mu` ``), it then calculates the maximum safe speed for every single point on the path. This means your robot will automatically know to slow down for sharp corners and speed up on the straights!
+5.  **Adding the Physics (Path Properties):** This is where the real brains are. The tool analyzes the path's geometry to calculate its **curvature** (how tight a turn is). Using physics parameters, it then calculates the maximum safe speed for every single point.
+
+6.  **Intelligent Segmentation (The Fun Part!):** Instead of just dumping a thousand tiny waypoints, the tool analyzes the curvature data. It intelligently groups the path into logical segments: **Straights** and **Arcs (Turns)**. You can tune this process in real-time in the **Segment Tuner** to get the perfect balance for your robot.
 
 ## 🔧 Setup & Installation
 
@@ -35,8 +37,8 @@ Getting started is easy. You'll need Python 3 installed.
 
 1.  **Clone the repository:**
     ```bash
-    git clone https://github.com/hrishiwastaken/tarzan-backendgit
-    cd tarzan-backend
+    git clone https://github.com/hrishiwastaken/tarzan-backend.git
+    cd your-repo-name
     ```
 
 2.  **Create a virtual environment (recommended):**
@@ -74,46 +76,43 @@ Getting started is easy. You'll need Python 3 installed.
 Follow the workflow buttons from top to bottom!
 
 1.  **Step 1: Load Image**
-    *   Click the `` `1. Load Image` `` button and select an image file (`.jpg`, `.png`, etc.).
+    *   Click the `1. Load Image` button and select an image file.
 
 2.  **Step 2: Tune Color Range**
-    *   Click `` `2. Tune Color Range...` ``. A new window will pop up.
-    *   Play with the `` `H` ``, `` `S` ``, and `` `V` `` sliders until the path you want to track is **bright white** and everything else is **black**.
-    *   Click `` `Apply` `` when you're happy.
+    *   Click `2. Tune Color Range...`.
+    *   Play with the `H`, `S`, and `V` sliders until the path is **bright white** and everything else is **black**.
+    *   Click `Apply`.
 
 3.  **Step 3: Calibrate Scale**
-    *   If you want your final CSV to be in real-world meters, click `` `Calibrate Pixel/Meter Scale...` ``.
-    *   Click on two points in your image (e.g., the start and end of a ruler or a known-length object).
-    *   A dialog box will ask for the real-world distance between those two points in meters. Enter it. Voilà, the app now knows how big things are!
+    *   This is important! Click `Calibrate Pixel/Meter Scale...`.
+    *   Click on two points in your image with a known real-world distance (e.g., the ends of a 1-meter ruler).
+    *   Enter the distance in meters when prompted. The app now knows how big things are.
 
 4.  **Step 4: Analyze & Select Endpoints**
-    *   Click `` `3. Analyze & Select Endpoints` ``. The app will process the image and overlay a grid of cyan nodes on the path's centerline.
-    *   The status bar will ask you to **click on the START node**. Hover over a node (it will turn yellow) and click.
-    *   The status bar will then ask you to **click on the END node**. Hover and click again.
-    *   The app will process the selection and draw the final smooth path in red.
+    *   Click `3. Analyze & Select Endpoints`. The app will overlay cyan nodes on the path's centerline.
+    *   Click your desired **START node**, then click your **END node**. The final smooth path will be drawn in red.
 
-5.  **Fine-Tune the Path (Optional)**
-    *   Use the **"Path Endpoint Control"** slider to shorten or lengthen the path from the end point.
-    *   Use the **"Number of Nodes to Display"** slider to change how many cyan dots you see (this is just for visualization).
-
-6.  **Step 5: Export Path to CSV**
-    *   Use the **"Export Path Resolution"** slider to decide how many points you want in your final CSV file (100 is a good start).
-    *   Click the big green `` `4. Export Path to CSV` `` button.
+5.  **Step 5: Tune and Export!**
+    *   Click the big green `4. Tune and Export Path...` button.
+    *   The **Interactive Segment Tuner** window will appear. You'll see your path colored in alternating shades of cyan (straights) and magenta (turns).
+    *   **Play with the sliders:**
+        *   **`Straightness Threshold`:** A higher value makes the app more "generous" about what it considers a straight line. Lower it to detect even very gentle curves as turns.
+        *   **`Minimum Segment Length`:** A higher value merges tiny, noisy segments into larger ones, cleaning up the path.
+    *   Watch the path colors change in real-time!
+    *   Once you're happy with the visual segmentation, click the **`Generate PATH.TXT`** button at the bottom of the tuner.
     *   Choose a file name and location, and you're done!
 
-## 📄 The Golden Output: Your CSV File
+## 📄 The Golden Output: Your `PATH.TXT` File
 
-The exported CSV file is simple and ready for your robot's controller. It contains four columns:
+The exported file is a simple list of commands, ready for your Arduino or other microcontroller. Each line is a segment with three values:
 
-| Column      | Description                                     | Unit    |
-|-------------|-------------------------------------------------|---------|
-| `` `x_m` ``       | The X-coordinate of the path point.             | meters  |
-| `` `y_m` ``       | The Y-coordinate of the path point.             | meters  |
-| `` `speed_mps` `` | The calculated maximum safe speed at that point.| m/s     |
-| `` `curvature` `` | The tightness of the curve at that point.       | 1/meter |
+| Column    | Description                                                                 | Unit      |
+|-----------|-----------------------------------------------------------------------------|-----------|
+| `DISTANCE`  | The length of this segment.                                                 | meters    |
+| `SPEED`     | The calculated average safe speed for this segment.                         | m/s       |
+| `CURVATURE` | The average tightness of the curve for this segment (0.0 for straights).    | 1/meter   |
 
-Your robot can now read this file line by line, moving to the next `(x, y)` coordinate while aiming for the target `speed_mps`. Although it will need a seperate .cpp program to use this raw data and translate it to something dynamic to the car.
-The .cpp program for a basic car will be added here soon. For now though, you're on your own ;)
+Your robot's code can now read this file line by line. For each line, it will drive forward while applying a turn proportional to the `CURVATURE` value, stopping only when its wheel encoders report that it has traveled the specified `DISTANCE`.
 
 ## ⚙️ Pro Tips & Tuning Knobs
 
@@ -128,8 +127,3 @@ planning_params = {
     'v_max': 2.5,       # The absolute top speed of your vehicle (m/s)
     # ... other advanced params
 }
-```
-*   **`` `mu` `` (Friction):** This is the most important one! Higher `` `mu` `` means more grip, allowing for higher speeds in corners. Lower it for slippery surfaces.
-*   **`` `v_max` `` (Max Velocity):** Set this to your robot's top speed. The calculated speeds will never exceed this value.
-
----
